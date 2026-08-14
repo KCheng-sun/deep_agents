@@ -6,7 +6,7 @@
 
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from loguru import logger
@@ -147,6 +147,17 @@ class MetadataStore:
                 content TEXT NOT NULL,
                 status TEXT DEFAULT 'approved',  -- 'approved' | 'rejected'
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS reviews (
+                note_id TEXT PRIMARY KEY,
+                ease_factor REAL DEFAULT 2.5,    -- SM-2 熟练度系数（下限 1.3）
+                interval_days INTEGER DEFAULT 0, -- 当前复习间隔
+                due_date TEXT,                   -- 下次复习日期（ISO）
+                review_count INTEGER DEFAULT 0,  -- 已复习次数
+                last_quality INTEGER,            -- 上次评分 0-5
+                last_reviewed_at TEXT,
+                FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS digest_reports (
@@ -615,6 +626,178 @@ class MetadataStore:
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ---- Reviews（SM-2 间隔重复） ----
+
+    @_synchronized
+    def get_review(self, note_id: str) -> dict | None:
+        """获取笔记的复习状态。"""
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT * FROM reviews WHERE note_id = ?", (note_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    @_synchronized
+    def upsert_review(
+        self,
+        note_id: str,
+        ease_factor: float,
+        interval_days: int,
+        due_date: str,
+        review_count: int,
+        last_quality: int,
+    ) -> None:
+        """写入/更新复习状态（SM-2 计算后的结果）。"""
+        assert self._conn is not None
+        now = datetime.now().isoformat()
+        self._conn.execute(
+            """INSERT INTO reviews
+               (note_id, ease_factor, interval_days, due_date, review_count, last_quality, last_reviewed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(note_id) DO UPDATE SET
+                 ease_factor = excluded.ease_factor,
+                 interval_days = excluded.interval_days,
+                 due_date = excluded.due_date,
+                 review_count = excluded.review_count,
+                 last_quality = excluded.last_quality,
+                 last_reviewed_at = excluded.last_reviewed_at""",
+            (note_id, ease_factor, interval_days, due_date, review_count, last_quality, now),
+        )
+        self._conn.commit()
+
+    @_synchronized
+    def get_due_reviews(self, limit: int = 50) -> list[dict]:
+        """一次 SQL 取全部到期复习（含笔记标题）。"""
+        assert self._conn is not None
+        today = date.today().isoformat()
+        rows = self._conn.execute(
+            """SELECT r.*, n.title, n.ingested_at
+               FROM reviews r
+               JOIN notes n ON n.id = r.note_id
+               WHERE n.status = 'active' AND r.due_date <= ?
+               ORDER BY r.due_date ASC LIMIT ?""",
+            (today, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @_synchronized
+    def get_review_candidates(self, limit: int = 10) -> list[dict]:
+        """从未进入复习系统的笔记（首次复习候选）。"""
+        assert self._conn is not None
+        rows = self._conn.execute(
+            """SELECT n.id, n.title, n.ingested_at, n.content_preview
+               FROM notes n
+               LEFT JOIN reviews r ON r.note_id = n.id
+               WHERE n.status = 'active' AND r.note_id IS NULL
+               ORDER BY n.ingested_at ASC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ---- 批量查询（避免 N+1 全表扫描） ----
+
+    @_synchronized
+    def list_notes_by_tag(self, tag_name: str, limit: int = 50) -> list[NoteMetadata]:
+        """按标签名（模糊匹配）一次 SQL 查出全部笔记。
+
+        替代"list_notes 全表 + 每篇再查标签"的 N+1 模式。
+        """
+        assert self._conn is not None
+        pattern = f"%{tag_name}%"
+        rows = self._conn.execute(
+            """SELECT DISTINCT n.* FROM notes n
+               JOIN note_tags nt ON n.id = nt.note_id
+               JOIN tags t ON t.id = nt.tag_id
+               WHERE n.status = 'active' AND t.name LIKE ?
+               ORDER BY n.created_at DESC LIMIT ?""",
+            (pattern, limit),
+        ).fetchall()
+        return [self._row_to_note(r) for r in rows]
+
+    @_synchronized
+    def get_tags_batch(self, note_ids: list[str]) -> dict[str, list[Tag]]:
+        """一次 SQL 批量取多篇笔记的标签。
+
+        Returns:
+            {note_id: [Tag, ...]}——无标签的笔记不出现在键中
+        """
+        assert self._conn is not None
+        if not note_ids:
+            return {}
+
+        placeholders = ",".join("?" for _ in note_ids)
+        rows = self._conn.execute(
+            f"""SELECT nt.note_id, t.id, t.name, t.category, t.is_ai_generated, nt.confidence
+               FROM note_tags nt
+               JOIN tags t ON t.id = nt.tag_id
+               WHERE nt.note_id IN ({placeholders})
+               ORDER BY t.category, t.name""",
+            note_ids,
+        ).fetchall()
+
+        result: dict[str, list[Tag]] = {}
+        for row in rows:
+            tag = Tag(
+                id=row["id"],
+                name=row["name"],
+                category=TagCategory(row["category"]) if row["category"] else TagCategory.TOPIC,
+                is_ai_generated=bool(row["is_ai_generated"]),
+                confidence=row["confidence"],
+            )
+            result.setdefault(row["note_id"], []).append(tag)
+        return result
+
+    @_synchronized
+    def get_tag_counts(self) -> dict[str, int]:
+        """一次 SQL 统计全部标签使用次数。"""
+        assert self._conn is not None
+        rows = self._conn.execute(
+            """SELECT t.name, COUNT(*) as cnt
+               FROM note_tags nt
+               JOIN tags t ON t.id = nt.tag_id
+               GROUP BY t.name"""
+        ).fetchall()
+        return {r["name"]: r["cnt"] for r in rows}
+
+    @_synchronized
+    def get_all_connections_flat(self) -> list[dict]:
+        """一次 SQL 取全部关联（含两端笔记标题）。"""
+        assert self._conn is not None
+        rows = self._conn.execute(
+            """SELECT c.source_note_id, c.target_note_id, c.relation_type,
+                      c.strength, c.description,
+                      n1.title AS source_title, n2.title AS target_title
+               FROM connections c
+               JOIN notes n1 ON n1.id = c.source_note_id
+               JOIN notes n2 ON n2.id = c.target_note_id
+               ORDER BY c.strength DESC"""
+        ).fetchall()
+        return [
+            {
+                "source": r["source_note_id"],
+                "target": r["target_note_id"],
+                "relation_type": r["relation_type"],
+                "strength": r["strength"],
+                "description": r["description"] or "",
+                "source_title": r["source_title"],
+                "target_title": r["target_title"],
+            }
+            for r in rows
+        ]
+
+    @_synchronized
+    def get_note_degree_map(self) -> dict[str, int]:
+        """一次 SQL 统计每篇笔记的关联数（度数）。"""
+        assert self._conn is not None
+        rows = self._conn.execute(
+            """SELECT note_id, COUNT(*) as degree FROM (
+                 SELECT source_note_id AS note_id FROM connections
+                 UNION ALL
+                 SELECT target_note_id FROM connections
+               ) GROUP BY note_id"""
+        ).fetchall()
+        return {r["note_id"]: r["degree"] for r in rows}
 
     # ---- RSS Feeds ----
 

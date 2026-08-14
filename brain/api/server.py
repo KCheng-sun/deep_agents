@@ -88,6 +88,13 @@ def _init():
     _scheduler = build_default_scheduler(_pipeline, _metadata_store, _vector_store)
     _scheduler.start()
 
+    # 回填历史知识片段的向量（幂等 upsert，已向量化的不受影响）
+    for frag in _metadata_store.list_knowledge_fragments(limit=10000):
+        try:
+            _vector_store.add_fragment(frag["id"], frag["title"], frag["content"])
+        except Exception as e:
+            logger.warning(f"片段 #{frag['id']} 向量回填失败: {e}")
+
 
 # 启动时预初始化
 @app.on_event("startup")
@@ -157,19 +164,6 @@ class DigestResponse(BaseModel):
     content: str
 
 
-class ReviewItem(BaseModel):
-    note_id: str
-    title: str
-    date: str
-    freshness: float
-    tags: list[str]
-
-
-class ReviewResponse(BaseModel):
-    total: int
-    items: list[ReviewItem]
-
-
 class SessionCreateRequest(BaseModel):
     title: str | None = None
 
@@ -206,6 +200,26 @@ def add_note(req: NoteAddRequest):
     _init()
     note_id = _pipeline.ingest_text_sync(req.text, title=req.title)
     return NoteResponse(note_id=note_id, message="摄入成功")
+
+
+@app.get("/api/notes/{note_id}/content")
+def get_note_content(note_id: str):
+    """精确取回笔记完整正文（复习卡片展开用）。"""
+    _init()
+    note = _metadata_store.get_note(note_id)
+    if note is None:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=404, detail="笔记不存在")
+
+    chunks = _vector_store.get_note_chunks(note_id)
+    content = "".join(c.content for c in chunks)
+    return {
+        "note_id": note_id,
+        "title": note.title,
+        "content": content,
+        "ingested_at": note.ingested_at,
+    }
 
 
 @app.post("/api/ingest", response_model=NoteResponse)
@@ -327,7 +341,7 @@ def ask_question_stream(req: AskRequest):
     memory_hits = _vector_store.search_memory(
         req.question,
         top_k=5,
-        exclude_session=session_id,
+        current_session=session_id,  # 同会话旧消息加权（FR27）
     )
 
     # 保存用户消息（同时写入记忆向量）
@@ -531,13 +545,14 @@ def list_fragments(limit: int = Query(50, ge=1, le=200)):
 
 @app.delete("/api/fragments/{fragment_id}")
 def delete_fragment(fragment_id: int):
-    """删除知识片段。"""
+    """删除知识片段（SQLite + 向量同步删除）。"""
     _init()
     ok = _metadata_store.delete_knowledge_fragment(fragment_id)
     if not ok:
         from fastapi import HTTPException
 
         raise HTTPException(status_code=404, detail="片段不存在")
+    _vector_store.delete_fragment(fragment_id)
     return {"ok": True}
 
 
@@ -738,95 +753,94 @@ def digest_reports(limit: int = Query(10, ge=1, le=50)):
 
 @app.get("/api/graph")
 def knowledge_graph():
-    """知识图谱数据——笔记节点 + 关联边。"""
+    """知识图谱数据——笔记节点 + 关联边。
+
+    全部走批量 SQL（一次取关联、一次取度数、一次取标签），
+    无 N+1 查询，500+ 笔记时依然毫秒级响应。
+    """
     _init()
 
+    # 一次 SQL：全部关联 + 两端标题
+    flat_conns = _metadata_store.get_all_connections_flat()
+
+    edges = [
+        {
+            "source": c["source"],
+            "target": c["target"],
+            "relation_type": c["relation_type"],
+            "strength": c["strength"],
+            "description": c["description"],
+        }
+        for c in flat_conns
+    ]
+
+    # 一次 SQL：度数统计
+    degree_map = _metadata_store.get_note_degree_map()
+
+    # 一次 SQL：全部笔记 + 批量标签
     all_notes = _metadata_store.list_notes(limit=10000)
-    all_conns: list[dict] = []
-    seen_pairs = set()
+    tags_map = _metadata_store.get_tags_batch([n.id for n in all_notes])
 
-    for note in all_notes:
-        conns = _metadata_store.get_connections(note.id)
-        for c in conns:
-            pair = tuple(sorted([c.source_note_id, c.target_note_id]))
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            all_conns.append({
-                "source": c.source_note_id,
-                "target": c.target_note_id,
-                "relation_type": c.relation_type.value,
-                "strength": c.strength,
-                "description": c.description or "",
-            })
-
-    # 节点信息（含标签和关联数）
-    nodes = []
-    degree = {}
-    for conn in all_conns:
-        degree[conn["source"]] = degree.get(conn["source"], 0) + 1
-        degree[conn["target"]] = degree.get(conn["target"], 0) + 1
-
-    for note in all_notes:
-        tags = _metadata_store.get_note_tags(note.id)
-        nodes.append({
+    nodes = [
+        {
             "id": note.id,
             "title": note.title[:30],
-            "tags": [t.name for t in tags][:3],
-            "degree": degree.get(note.id, 0),
+            "tags": [t.name for t in tags_map.get(note.id, [])][:3],
+            "degree": degree_map.get(note.id, 0),
             "date": note.ingested_at[:10] if note.ingested_at else "",
-        })
+        }
+        for note in all_notes
+    ]
 
-    return {"nodes": nodes, "edges": all_conns}
+    return {"nodes": nodes, "edges": edges}
 
 
 @app.get("/api/status", response_model=StatusResponse)
 def get_status():
-    """知识库统计概览。"""
+    """知识库统计概览。
+
+    全部走批量 SQL（一次标签统计、一次关联、一次批量标签），
+    无 N+1 查询。
+    """
     _init()
 
     chunk_count = _vector_store.count()
     note_count = _metadata_store.count_notes()
-    all_notes = _metadata_store.list_notes(limit=10000)
 
-    tag_counts: dict[str, int] = {}
-    total_conns = 0
-    all_conns: list[dict] = []
-    seen_pairs = set()
+    # 一次 SQL：标签统计
+    tag_counts = _metadata_store.get_tag_counts()
 
-    for note in all_notes:
-        tags = _metadata_store.get_note_tags(note.id)
-        for t in tags:
-            tag_counts[t.name] = tag_counts.get(t.name, 0) + 1
-        conns = _metadata_store.get_connections(note.id)
-        for c in conns:
-            pair = tuple(sorted([c.source_note_id, c.target_note_id]))
-            if pair not in seen_pairs:
-                seen_pairs.add(pair)
-                total_conns += 1
-                source_note = _metadata_store.get_note(c.source_note_id)
-                target_note = _metadata_store.get_note(c.target_note_id)
-                all_conns.append({
-                    "source_title": source_note.title if source_note else c.source_note_id[:8],
-                    "target_title": target_note.title if target_note else c.target_note_id[:8],
-                    "relation_type": c.relation_type.value,
-                    "description": c.description,
-                    "strength": c.strength,
-                })
+    # 一次 SQL：全部关联（含标题）
+    flat_conns = _metadata_store.get_all_connections_flat()
+    total_conns = len(flat_conns)
+    all_conns = [
+        {
+            "source_title": c["source_title"],
+            "target_title": c["target_title"],
+            "relation_type": c["relation_type"],
+            "description": c["description"],
+            "strength": c["strength"],
+        }
+        for c in flat_conns
+    ]
 
     top_tags = [
         {"name": name, "count": count}
         for name, count in sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:10]
     ]
 
-    recent_notes = []
-    for note in _metadata_store.list_notes(limit=5):
-        tags = _metadata_store.get_note_tags(note.id)
-        recent_notes.append({
-            "note_id": note.id, "title": note.title,
+    # 一次 SQL：最近笔记 + 批量标签
+    recent = _metadata_store.list_notes(limit=5)
+    tags_map = _metadata_store.get_tags_batch([n.id for n in recent])
+    recent_notes = [
+        {
+            "note_id": note.id,
+            "title": note.title,
             "date": note.ingested_at[:10] if note.ingested_at else "?",
-            "tags": [t.name for t in tags],
-        })
+            "tags": [t.name for t in tags_map.get(note.id, [])],
+        }
+        for note in recent
+    ]
 
     return StatusResponse(
         note_count=note_count, chunk_count=chunk_count,
@@ -837,31 +851,20 @@ def get_status():
 
 @app.get("/api/connections", response_model=list[ConnectionItem])
 def get_connections():
-    """获取所有关联。"""
+    """获取所有关联（一次 SQL JOIN 查询）。"""
     _init()
 
-    all_notes = _metadata_store.list_notes(limit=10000)
-    items: list[ConnectionItem] = []
-    seen = set()
-
-    for note in all_notes:
-        conns = _metadata_store.get_connections(note.id)
-        for c in conns:
-            pair = tuple(sorted([c.source_note_id, c.target_note_id]))
-            if pair in seen:
-                continue
-            seen.add(pair)
-            source_note = _metadata_store.get_note(c.source_note_id)
-            target_note = _metadata_store.get_note(c.target_note_id)
-            items.append(ConnectionItem(
-                source_title=source_note.title if source_note else c.source_note_id[:8],
-                target_title=target_note.title if target_note else c.target_note_id[:8],
-                relation_type=c.relation_type.value,
-                description=c.description,
-                strength=c.strength,
-            ))
-
-    return items
+    flat_conns = _metadata_store.get_all_connections_flat()
+    return [
+        ConnectionItem(
+            source_title=c["source_title"],
+            target_title=c["target_title"],
+            relation_type=c["relation_type"],
+            description=c["description"],
+            strength=c["strength"],
+        )
+        for c in flat_conns
+    ]
 
 
 @app.get("/api/digest", response_model=DigestResponse)
@@ -873,21 +876,26 @@ def get_digest(weekly: bool = Query(False)):
     return DigestResponse(content=result)
 
 
-@app.get("/api/review", response_model=ReviewResponse)
-def get_review(limit: int = Query(5, ge=1, le=20)):
-    """复习提醒。"""
+@app.get("/api/review")
+def get_review(limit: int = Query(10, ge=1, le=50)):
+    """SM-2 到期复习列表（含未进入系统的新卡片）。"""
     _init()
     svc = ReviewService(_metadata_store)
     due = svc.get_due_items_sync(limit=limit)
-    items = [
-        ReviewItem(
-            note_id=note.id, title=note.title,
-            date=note.ingested_at[:10] if note.ingested_at else "?",
-            freshness=round(freshness, 3), tags=tags,
-        )
-        for note, freshness, tags in due
-    ]
-    return ReviewResponse(total=len(items), items=items)
+    return {"total": len(due), "items": due}
+
+
+class ReviewRecordRequest(BaseModel):
+    note_id: str = Field(..., description="笔记 ID")
+    quality: int = Field(..., ge=0, le=5, description="0-5 评分（0-2忘记/3困难/4良好/5简单）")
+
+
+@app.post("/api/review/record")
+def record_review(req: ReviewRecordRequest):
+    """记录复习评分，SM-2 计算下次复习时间。"""
+    _init()
+    svc = ReviewService(_metadata_store)
+    return svc.record_review_sync(req.note_id, req.quality)
 
 
 # ============================================================

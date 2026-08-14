@@ -43,9 +43,14 @@ class VectorStore:
             name="conversation_memory",
             metadata={"hnsw:space": "cosine"},
         )
+        # 知识片段 collection——HIL 沉淀片段的向量（第三层记忆）
+        self._fragment_collection = self._client.get_or_create_collection(
+            name="fragment_memory",
+            metadata={"hnsw:space": "cosine"},
+        )
         logger.info(
             f"VectorStore 已连接: {self._persist_dir} "
-            f"(collections: notes, conversation_memory)"
+            f"(collections: notes, conversation_memory, fragment_memory)"
         )
 
     # ---- 写入 ----
@@ -81,6 +86,44 @@ class VectorStore:
         return ids
 
     # ---- 检索 ----
+
+    def get_note_chunks(self, note_id: str) -> list[SearchResult]:
+        """按 note_id 精确取回笔记的全部正文分块。
+
+        用 ChromaDB 的 metadata 过滤（collection.get where），
+        不做语义搜索——语义搜索 ID 字符串是碰运气。
+
+        Args:
+            note_id: 笔记 ID
+
+        Returns:
+            该笔记的全部 chunks，按 chunk_index 升序
+        """
+        results = self._collection.get(
+            where={"note_id": note_id},
+            include=["documents", "metadatas"],
+        )
+        if not results["ids"]:
+            return []
+
+        chunks: list[SearchResult] = []
+        for i, chunk_id in enumerate(results["ids"]):
+            metadata = results["metadatas"][i] if results["metadatas"] else {}
+            content = results["documents"][i] if results["documents"] else ""
+            chunks.append(
+                SearchResult(
+                    chunk_id=chunk_id,
+                    note_id=note_id,
+                    note_title=metadata.get("title", ""),
+                    content=content,
+                    score=1.0,  # 精确匹配，无相似度概念
+                    metadata=metadata,
+                )
+            )
+
+        # 按 chunk_index 排序，保持原文顺序
+        chunks.sort(key=lambda c: c.metadata.get("chunk_index", 0))
+        return chunks
 
     def search(self, query: str, top_k: int = 10) -> list[SearchResult]:
         """语义搜索——返回与查询最相关的分块。
@@ -194,13 +237,21 @@ class VectorStore:
             f"VectorStore: 记忆已写入 msg_{message_id} ({role}, {len(chunks)} 块)"
         )
 
-    def search_memory(self, query: str, top_k: int = 5, exclude_session: str | None = None) -> list[SearchResult]:
+    def search_memory(
+        self,
+        query: str,
+        top_k: int = 5,
+        current_session: str | None = None,
+        session_boost: float = 0.15,
+    ) -> list[SearchResult]:
         """检索与查询相关的历史对话消息（跨会话）。
 
         Args:
             query: 当前问题
             top_k: 返回条数
-            exclude_session: 排除指定会话（默认排除当前会话，避免"自己查自己"）
+            current_session: 当前会话 ID——同会话消息加分（session_boost），
+                保住超过工作窗口（10 轮）的旧消息的对话连续性
+            session_boost: 同会话消息的分数加成
 
         Returns:
             相关历史消息列表
@@ -210,10 +261,10 @@ class VectorStore:
 
         # 截断查询，避免超过 BGE 512 token 限制
         query_embedding = self._embedding_fn([query[:300]])
-        # 检索更多候选，过滤后再截断
+        # 检索更多候选，加权重排后截断
         results = self._memory_collection.query(
             query_embeddings=query_embedding,
-            n_results=min(top_k * 3, 30),
+            n_results=min(top_k * 4, 40),
             include=["documents", "metadatas", "distances"],
         )
 
@@ -223,12 +274,15 @@ class VectorStore:
 
         for i, chunk_id in enumerate(results["ids"][0]):
             metadata = results["metadatas"][0][i] if results["metadatas"] else {}
-            # 排除当前会话的消息（最近窗口已覆盖）
-            if exclude_session and metadata.get("session_id") == exclude_session:
-                continue
 
             distance = results["distances"][0][i]
             score = 1.0 - distance
+
+            # 同会话加权：旧消息（超出工作窗口的）在竞争中优先
+            is_current = current_session and metadata.get("session_id") == current_session
+            if is_current:
+                score += session_boost
+
             content = results["documents"][0][i] if results["documents"] else ""
 
             search_results.append(
@@ -238,14 +292,13 @@ class VectorStore:
                     note_title=f"{metadata.get('role', '?')}消息",
                     content=content,
                     score=round(score, 4),
-                    metadata=metadata,
+                    metadata={**metadata, "is_current_session": bool(is_current)},
                 )
             )
 
-            if len(search_results) >= top_k:
-                break
-
-        return search_results
+        # 加权重排后取 top_k（同会话消息因 boost 排序靠前）
+        search_results.sort(key=lambda r: r.score, reverse=True)
+        return search_results[:top_k]
 
     def delete_session_memory(self, session_id: str) -> None:
         """删除某会话的全部记忆向量。"""
@@ -259,6 +312,72 @@ class VectorStore:
             logger.info(
                 f"VectorStore: 已删除会话 {session_id} 的 {len(ids_to_delete)} 条记忆"
             )
+
+    # ---- 知识片段（第三层记忆：向量化 + 语义检索） ----
+
+    def add_fragment(self, fragment_id: int, title: str, content: str) -> None:
+        """知识片段向量化入库。
+
+        标题+内容拼接后整体嵌入（片段通常较短，无需分块）。
+
+        Args:
+            fragment_id: 片段在 SQLite 中的自增 ID
+            title: 片段标题
+            content: 片段内容
+        """
+        text = f"{title}。{content}".strip()
+        if not text:
+            return
+
+        embedding = self._embedding_fn([text[:500]])
+        # upsert：幂等，可安全用于启动回填（重复写入不会产生重复向量）
+        self._fragment_collection.upsert(
+            ids=[f"frag_{fragment_id}"],
+            embeddings=embedding,
+            documents=[text[:500]],
+            metadatas=[{"fragment_id": fragment_id, "title": title}],
+        )
+        logger.debug(f"VectorStore: 片段向量已写入 frag_{fragment_id}")
+
+    def delete_fragment(self, fragment_id: int) -> None:
+        """删除片段的向量。"""
+        self._fragment_collection.delete(ids=[f"frag_{fragment_id}"])
+        logger.debug(f"VectorStore: 片段向量已删除 frag_{fragment_id}")
+
+    def search_fragments(self, query: str, top_k: int = 5) -> list[SearchResult]:
+        """语义检索知识片段。"""
+        if not query.strip():
+            return []
+
+        query_embedding = self._embedding_fn([query[:300]])
+        results = self._fragment_collection.query(
+            query_embeddings=query_embedding,
+            n_results=min(top_k, 20),
+            include=["documents", "metadatas", "distances"],
+        )
+
+        search_results: list[SearchResult] = []
+        if not results["ids"] or not results["ids"][0]:
+            return search_results
+
+        for i, chunk_id in enumerate(results["ids"][0]):
+            metadata = results["metadatas"][0][i] if results["metadatas"] else {}
+            distance = results["distances"][0][i]
+            score = 1.0 - distance
+            content = results["documents"][0][i] if results["documents"] else ""
+
+            search_results.append(
+                SearchResult(
+                    chunk_id=chunk_id,
+                    note_id=str(metadata.get("fragment_id", "")),
+                    note_title=metadata.get("title", "知识片段"),
+                    content=content,
+                    score=round(score, 4),
+                    metadata=metadata,
+                )
+            )
+
+        return search_results
 
     # ---- 统计 ----
 

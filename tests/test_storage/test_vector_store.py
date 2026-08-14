@@ -88,13 +88,24 @@ class TestConversationMemory:
         assert len(results) == 1
         assert results[0].metadata["session_id"] == "s1"
 
-    def test_search_memory_excludes_session(self, vector_store):
+    def test_search_memory_current_session_boost(self, vector_store):
+        """同会话消息加权：带 is_current_session 标记，分数含 boost。
+
+        注意：mock embedding 相似度接近随机，只断言标记和分数范围，
+        不做跨会话分数比较。
+        """
         vector_store.add_memory(1, "s1", "user", "checkpoint 机制")
         vector_store.add_memory(2, "s2", "user", "checkpoint 持久化")
-        # 排除 s1 后只剩 s2 的结果
-        results = vector_store.search_memory("checkpoint", top_k=10, exclude_session="s1")
-        assert all(r.metadata["session_id"] == "s2" for r in results)
-        assert len(results) == 1
+        results = vector_store.search_memory("checkpoint", top_k=10, current_session="s1")
+
+        # 同会话消息应有加权标记
+        s1_results = [r for r in results if r.metadata["session_id"] == "s1"]
+        assert s1_results, "同会话消息应出现在结果中"
+        assert all(r.metadata["is_current_session"] for r in s1_results)
+
+        # 其他会话消息无加权标记
+        other = [r for r in results if r.metadata["session_id"] != "s1"]
+        assert all(not r.metadata["is_current_session"] for r in other)
 
     def test_search_memory_respects_top_k(self, vector_store):
         for i in range(5):
@@ -121,3 +132,33 @@ class TestConversationMemory:
         vector_store.add_memory(1, "s1", "user", "   ")
         results = vector_store.search_memory("任意", top_k=5)
         assert results == []
+
+
+class TestFragmentMemory:
+    """知识片段向量（第三层记忆）"""
+
+    def test_add_and_search_fragment(self, vector_store):
+        vector_store.add_fragment(1, "SqliteSaver 生产选型", "生产环境用 SqliteSaver 持久化状态")
+        results = vector_store.search_fragments("checkpoint 存储方案", top_k=5)
+        # mock embedding 无真实语义，验证有结果且元数据正确
+        assert len(results) >= 1
+        assert results[0].metadata["fragment_id"] == 1
+        assert results[0].note_title == "SqliteSaver 生产选型"
+
+    def test_add_fragment_idempotent(self, vector_store):
+        """upsert 幂等：重复写入同 ID 不产生重复向量。"""
+        vector_store.add_fragment(7, "重复片段", "内容")
+        vector_store.add_fragment(7, "重复片段", "内容")
+        results = vector_store.search_fragments("重复片段", top_k=10)
+        # 同 fragment_id 只出现一次
+        ids = [r.metadata["fragment_id"] for r in results]
+        assert ids.count(7) == 1
+
+    def test_delete_fragment(self, vector_store):
+        vector_store.add_fragment(3, "待删片段", "内容")
+        vector_store.delete_fragment(3)
+        results = vector_store.search_fragments("待删片段", top_k=10)
+        assert all(r.metadata["fragment_id"] != 3 for r in results)
+
+    def test_search_fragments_empty_query(self, vector_store):
+        assert vector_store.search_fragments("") == []

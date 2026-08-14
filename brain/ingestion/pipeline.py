@@ -299,22 +299,33 @@ class IngestionPipeline:
         return state
 
     def _find_candidates(self, doc: ParsedDocument, top_k: int = 20) -> list[dict]:
-        """向量粗筛——找到与新笔记最相似的历史笔记。"""
+        """向量粗筛——找到与新笔记最相似的历史笔记。
+
+        排除两种"自己":
+          1. 同 note_id 的重复命中（向量检索同笔记多 chunk 命中）
+          2. 同 file_hash 的旧版本（同一文件修改后重新摄入时，
+             旧版本内容几乎相同，会被向量检索命中但其实是自己）
+        """
         # 查询用标题 + 前 300 字符——BGE 模型最大 512 token 限制
         query = f"{doc.title} {doc.content[:300]}"
-        results = self.vector_store.search(query, top_k=top_k)
+        results = self.vector_store.search(query, top_k=top_k * 2)
 
         if not results:
             return []
 
-        # 去重，排除自己（如果 file_hash 匹配）
         seen = set()
         candidates = []
         for r in results:
             if r.note_id in seen:
                 continue
-            # 排除相同 file_hash 的笔记（同一文件重复摄入）
             seen.add(r.note_id)
+
+            # 排除 file_hash 相同的旧版本（同一文件的先前摄入）
+            if doc.file_hash:
+                existing = self.metadata_store.get_note(r.note_id)
+                if existing and existing.file_hash == doc.file_hash:
+                    continue
+
             candidates.append(
                 {
                     "note_id": r.note_id,
@@ -322,8 +333,10 @@ class IngestionPipeline:
                     "content": r.content,
                 }
             )
+            if len(candidates) >= top_k:
+                break
 
-        return candidates[:top_k]
+        return candidates
 
     # ================================================================
     # Phase 1 节点 — 元数据写入（扩展了 tags 和 connections）

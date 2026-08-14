@@ -43,6 +43,7 @@ class ResearcherAgent:
         tools = self._build_tools()
         llm = get_chat_model()
         ms = self._metadata_store
+        vs = self._vector_store
 
         from deepagents import SubAgent, create_deep_agent
 
@@ -88,7 +89,13 @@ class ResearcherAgent:
                 title: 片段标题（不超过 20 字）
                 content: 片段内容（一段话，可含多个要点）
             """
-            ms.add_knowledge_fragment(title=title.strip()[:20], content=content.strip(), session_id=session_id)
+            clean_title = title.strip()[:20]
+            clean_content = content.strip()
+            fragment_id = ms.add_knowledge_fragment(
+                title=clean_title, content=clean_content, session_id=session_id
+            )
+            # 同步写入向量（供语义检索）
+            vs.add_fragment(fragment_id, clean_title, clean_content)
             logger.info(f"[knowledge-extractor] 知识片段已保存: {title}")
             return f"知识片段「{title}」已保存。"
 
@@ -186,17 +193,17 @@ class ResearcherAgent:
         # 组装多轮消息列表：系统上下文 + 历史 + 当前问题
         messages: list[dict] = []
 
-        # 第二层记忆：跨会话的相关历史消息以 system 注入
+        # 第二层记忆：相关历史消息以 system 注入（同会话旧消息标记"本会话"）
         if memory_hits:
             memory_section = "\n".join(
-                f"- [{m.note_title}] {m.content[:200]}"
+                f"- [{m.note_title}{'(本会话)' if m.metadata.get('is_current_session') else ''}] {m.content[:200]}"
                 for m in memory_hits
             )
             messages.append(
                 {
                     "role": "system",
                     "content": (
-                        "以下是你在过往对话中讨论过的相关内容（跨会话记忆），"
+                        "以下是你在过往对话中讨论过的相关内容（检索记忆），"
                         "回答时可参考，但用户没有明确提及时不要主动大段复述：\n"
                         f"{memory_section}"
                     ),
@@ -437,20 +444,22 @@ class ResearcherAgent:
             """搜索已沉淀的知识片段（此前对话中经用户确认保存的结论）。
 
             当用户询问"我之前总结过什么"或需要引用过往对话沉淀的结论时使用。
+            语义检索——不需要精确关键词，意思相近即可命中。
 
             Args:
-                keyword: 搜索关键词
+                keyword: 搜索关键词或描述
                 limit: 返回条数（默认 5）
             """
-            fragments = ms.search_knowledge_fragments(keyword, limit=limit)
-            if not fragments:
+            results = vs.search_fragments(keyword, top_k=limit)
+            if not results:
                 return f"没有找到与 '{keyword}' 相关的知识片段。"
 
             lines = ["沉淀的知识片段:\n"]
-            for i, f in enumerate(fragments, 1):
+            for i, r in enumerate(results, 1):
+                frag_id = r.note_id  # 向量里存的 fragment_id
                 lines.append(
-                    f"{i}. 【{f['title']}】(片段 #{f['id']}, {f['created_at'][:10]})\n"
-                    f"   {f['content'][:400]}"
+                    f"{i}. 【{r.note_title}】(片段 #{frag_id}, 相似度 {r.score:.2f})\n"
+                    f"   {r.content[:400]}"
                 )
             return "\n\n".join(lines)
 
@@ -462,8 +471,10 @@ class ResearcherAgent:
             tags = ms.get_note_tags(note_id) if note else []
             tag_str = ", ".join(t.name for t in tags) if tags else "无标签"
 
-            chunks = vs.search(f"id:{note_id}", top_k=1)
-            content = chunks[0].content if chunks else "(内容未找到)"
+            # 精确取回全部正文分块（按 chunk_index 排序拼接），
+            # 不做语义搜索——ID 字符串语义搜索是碰运气
+            chunks = vs.get_note_chunks(note_id)
+            content = "".join(c.content for c in chunks) if chunks else "(内容未找到)"
             return f"标题: {title}\n标签: {tag_str}\n内容: {content}"
 
         @tool
@@ -488,18 +499,20 @@ class ResearcherAgent:
         @tool
         def search_by_tag(tag_name: str) -> str:
             """按标签查找笔记（支持部分匹配）。"""
-            all_notes = ms.list_notes(limit=10000)
-            matched = []
-            for note in all_notes:
-                note_tags = ms.get_note_tags(note.id)
-                if any(tag_name.lower() in t.name.lower() for t in note_tags):
-                    tag_names = [t.name for t in note_tags]
-                    matched.append(
-                        f"- [{note.ingested_at[:10] if note.ingested_at else '?'}] "
-                        f"{note.title}  [标签: {', '.join(tag_names)}]"
-                    )
-            if not matched:
+            # 一次 SQL JOIN 查询（list_notes_by_tag），避免 N+1 全表扫描
+            notes = ms.list_notes_by_tag(tag_name, limit=20)
+            if not notes:
                 return f"未找到标签含 '{tag_name}' 的笔记。"
-            return "匹配的笔记:\n\n" + "\n".join(matched[:20])
+
+            # 批量取标签（一次 SQL），拼显示文本
+            tags_map = ms.get_tags_batch([n.id for n in notes])
+            matched = []
+            for note in notes:
+                tag_names = [t.name for t in tags_map.get(note.id, [])]
+                matched.append(
+                    f"- [{note.ingested_at[:10] if note.ingested_at else '?'}] "
+                    f"{note.title}  [标签: {', '.join(tag_names)}]"
+                )
+            return "匹配的笔记:\n\n" + "\n".join(matched)
 
         return [search_notes, search_fragments, get_note_detail, get_connections, search_by_tag]

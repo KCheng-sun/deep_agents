@@ -1,4 +1,4 @@
-"""Brain CLI — 个人知识管家的命令行入口。
+﻿"""Brain CLI — 个人知识管家的命令行入口。
 
 用法:
     brain add "今天读到的好观点..."
@@ -32,14 +32,9 @@ def _get_pipeline() -> IngestionPipeline:
     embedding_fn = get_embedding_fn()
     vector_store = VectorStore(persist_dir=cfg.storage.chroma_dir, embedding_fn=embedding_fn)
     metadata_store = MetadataStore(db_path=cfg.storage.db_path)
-    # 在事件循环中初始化 metadata_store
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    # MetadataStore 是同步实现，直接初始化（无需事件循环包装）
     if not hasattr(_get_pipeline, "_metadata_initialized"):
-        loop.run_until_complete(metadata_store.initialize())
+        metadata_store.initialize()
         _get_pipeline._metadata_initialized = True
 
     pipeline = IngestionPipeline(
@@ -58,13 +53,9 @@ def _get_search_components():
     vector_store = VectorStore(persist_dir=cfg.storage.chroma_dir, embedding_fn=embedding_fn)
 
     metadata_store = MetadataStore(db_path=cfg.storage.db_path)
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    # MetadataStore 是同步实现，直接初始化
     if not hasattr(_get_search_components, "_md_initialized"):
-        loop.run_until_complete(metadata_store.initialize())
+        metadata_store.initialize()
         _get_search_components._md_initialized = True
 
     return vector_store, metadata_store
@@ -220,17 +211,12 @@ def search(query: str, top_k: int, tag: str | None):
     """
     vector_store, metadata_store = _get_search_components()
 
-    # 标签过滤: 获取匹配标签的所有 note_id
+    # 标签过滤: 一次 SQL JOIN 查匹配标签的笔记（避免 N+1）
     tag_note_ids: set | None = None
     if tag:
         click.echo(f"🔍 搜索: {query}  [标签: {tag}]\n")
-        # 查询 SQLite 中有该标签的所有活跃笔记
-        all_notes = _run_async(metadata_store.list_notes(limit=10000))
-        tag_note_ids = set()
-        for note in all_notes:
-            note_tags = _run_async(metadata_store.get_note_tags(note.id))
-            if any(tag.lower() in t.name.lower() for t in note_tags):
-                tag_note_ids.add(note.id)
+        matched_notes = metadata_store.list_notes_by_tag(tag, limit=10000)
+        tag_note_ids = {n.id for n in matched_notes}
         if not tag_note_ids:
             click.echo(f"  没有标记为 '{tag}' 的笔记。")
             return
@@ -264,7 +250,7 @@ def search(query: str, top_k: int, tag: str | None):
         title = best.note_title or best.metadata.get("title", "无标题")
 
         # 获取标签用于显示
-        note_tags = _run_async(metadata_store.get_note_tags(note_id))
+        note_tags = metadata_store.get_note_tags(note_id)
         tag_str = ""
         if note_tags:
             tag_names = [t.name for t in note_tags[:3]]
@@ -374,17 +360,17 @@ def status():
     vector_store, metadata_store = _get_search_components()
 
     chunk_count = vector_store.count()
-    note_count = _run_async(metadata_store.count_notes())
+    note_count = metadata_store.count_notes()
 
     # 标签统计
-    all_notes = _run_async(metadata_store.list_notes(limit=10000))
+    all_notes = metadata_store.list_notes(limit=10000)
     tag_counts: dict[str, int] = {}
     total_connections = 0
     for note in all_notes:
-        tags = _run_async(metadata_store.get_note_tags(note.id))
+        tags = metadata_store.get_note_tags(note.id)
         for t in tags:
             tag_counts[t.name] = tag_counts.get(t.name, 0) + 1
-        conns = _run_async(metadata_store.get_connections(note.id))
+        conns = metadata_store.get_connections(note.id)
         total_connections += len(conns)
     # 每个 connection 被数了两次（source 和 target 各一次）
     total_connections //= 2
@@ -403,12 +389,12 @@ def status():
             click.echo(f"  [{count}] {name}")
 
     # 最近笔记
-    recent_notes = _run_async(metadata_store.list_notes(limit=5))
+    recent_notes = metadata_store.list_notes(limit=5)
     if recent_notes:
         click.echo("\n📝 最近摄入的笔记:")
         for note in recent_notes:
             date_str = note.ingested_at[:10] if note.ingested_at else "未知"
-            tags = _run_async(metadata_store.get_note_tags(note.id))
+            tags = metadata_store.get_note_tags(note.id)
             tag_str = ""
             if tags:
                 tag_str = "  [" + ", ".join(t.name for t in tags[:3]) + "]"
@@ -434,12 +420,12 @@ def connections(note_id: str | None):
 
     if note_id:
         # 查看特定笔记的关联
-        note = _run_async(metadata_store.get_note(note_id))
+        note = metadata_store.get_note(note_id)
         if note is None:
             click.echo(f"❌ 笔记不存在: {note_id}")
             return
 
-        conns = _run_async(metadata_store.get_connections(note_id))
+        conns = metadata_store.get_connections(note_id)
         click.echo(f"🔗 {note.title} 的关联 ({len(conns)} 条)\n")
 
         if not conns:
@@ -449,7 +435,7 @@ def connections(note_id: str | None):
         for c in conns:
             # 判断当前笔记是 source 还是 target
             other_id = c.target_note_id if c.source_note_id == note_id else c.source_note_id
-            other_note = _run_async(metadata_store.get_note(other_id))
+            other_note = metadata_store.get_note(other_id)
             other_title = other_note.title if other_note else other_id[:8]
 
             relation_icon = {
@@ -466,18 +452,18 @@ def connections(note_id: str | None):
             click.echo()
     else:
         # 列出全部关联
-        all_notes = _run_async(metadata_store.list_notes(limit=10000))
+        all_notes = metadata_store.list_notes(limit=10000)
         all_conns: list[tuple] = []  # (conn, source_title, target_title)
         seen = set()
 
         for note in all_notes:
-            conns = _run_async(metadata_store.get_connections(note.id))
+            conns = metadata_store.get_connections(note.id)
             for c in conns:
                 pair = tuple(sorted([c.source_note_id, c.target_note_id]))
                 if pair not in seen:
                     seen.add(pair)
-                    source_note = _run_async(metadata_store.get_note(c.source_note_id))
-                    target_note = _run_async(metadata_store.get_note(c.target_note_id))
+                    source_note = metadata_store.get_note(c.source_note_id)
+                    target_note = metadata_store.get_note(c.target_note_id)
                     all_conns.append((
                         c,
                         source_note.title if source_note else c.source_note_id[:8],
@@ -557,28 +543,28 @@ def review(limit: int):
     from brain.services.review import ReviewService
 
     svc = ReviewService(metadata_store)
-    due = _run_async(svc.get_due_items(limit=limit))
+    due = svc.get_due_items_sync(limit=limit)
 
     if not due:
-        click.echo("✅ 所有笔记都是最近摄入的，暂无需要复习的内容。")
+        click.echo("✅ 暂无需要复习的内容。")
         return
 
     click.echo(f"📖 需要复习的笔记 ({len(due)} 条)\n")
 
-    for i, (note, freshness, tags) in enumerate(due, 1):
-        # 新鲜度转文字
-        if freshness < 0.2:
-            status = "🔴"
-        elif freshness < 0.3:
-            status = "🟡"
+    for i, item in enumerate(due, 1):
+        title = item["title"]
+        if item["is_new"]:
+            status = "🆕"
+            schedule = "首次进入复习"
         else:
-            status = "🟢"
+            status = "🔁"
+            schedule = (
+                f"第 {item['review_count']} 次复习 | 间隔 {item['interval_days']} 天"
+            )
 
-        date_str = note.ingested_at[:10] if note.ingested_at else "未知"
-        tag_str = " [" + ", ".join(tags[:2]) + "]" if tags else ""
-
-        click.echo(f"  {i}. {status} [{date_str}] {note.title}{tag_str}")
-        click.echo(f"     新鲜度: {freshness:.0%}  |  id: {note.id}")
+        date_str = item.get("ingested_at", "")[:10] or "未知"
+        click.echo(f"  {i}. {status} [{date_str}] {title}")
+        click.echo(f"     {schedule}  |  下次: {item.get('due_date', '?')}")
         click.echo()
 
 
