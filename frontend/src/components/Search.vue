@@ -1,6 +1,11 @@
 <script setup>
-import { ref } from "vue";
+import { ref, watch } from "vue";
 import { searchNotes } from "../api/index.js";
+
+// 跨页跳转种子: { query, ts } —— 问答引用点击跳来时自动搜索
+const props = defineProps({
+  seed: { type: Object, default: null },
+});
 
 const query = ref("");
 const tag = ref("");
@@ -22,6 +27,18 @@ async function search() {
     loading.value = false;
   }
 }
+
+// 外部跳转：预填查询并立即搜索
+watch(
+  () => props.seed,
+  (newSeed) => {
+    if (newSeed && newSeed.query) {
+      query.value = newSeed.query;
+      search();
+    }
+  },
+  { immediate: true }
+);
 </script>
 
 <template>

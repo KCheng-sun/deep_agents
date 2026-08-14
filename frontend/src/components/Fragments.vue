@@ -1,7 +1,10 @@
 <script setup>
-import { ref, onMounted } from "vue";
+import { ref, onMounted, inject } from "vue";
 import { listFragments } from "../api/index.js";
 import axios from "axios";
+
+// 跨页跳转：跳问答页展开讲讲该片段
+const jumpToAsk = inject("jumpToAsk", null);
 
 const fragments = ref([]);
 const loading = ref(false);
@@ -52,6 +55,13 @@ onMounted(refresh);
         <button class="delete-btn" title="删除片段" @click="removeFragment(f.id)">✕</button>
       </div>
       <div class="fragment-content">{{ f.content }}</div>
+      <button
+        v-if="jumpToAsk"
+        class="expand-btn"
+        @click="jumpToAsk(`关于我沉淀的知识片段「${f.title}」，请展开详细讲讲`)"
+      >
+        💬 展开讲讲
+      </button>
     </div>
   </div>
 </template>
@@ -139,5 +149,19 @@ onMounted(refresh);
   color: var(--text-dim);
   line-height: 1.6;
   white-space: pre-wrap;
+  margin-bottom: 10px;
+}
+.expand-btn {
+  padding: 6px 16px;
+  background: transparent;
+  border: 1px solid var(--border-glow);
+  color: var(--primary);
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+.expand-btn:hover {
+  background: rgba(0, 132, 255, 0.08);
 }
 </style>

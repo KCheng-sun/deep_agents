@@ -1,7 +1,10 @@
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from "vue";
+import { ref, onMounted, onBeforeUnmount, inject } from "vue";
 import * as echarts from "echarts";
 import axios from "axios";
+
+// 跨页跳转：注入 App 提供的函数
+const jumpToAsk = inject("jumpToAsk", null);
 
 const chartEl = ref(null);
 const chart = ref(null);
@@ -193,6 +196,13 @@ onBeforeUnmount(() => {
         <div>🔗 关联数: {{ selectedNode._detail.degree }}</div>
         <div>📅 {{ selectedNode._detail.date }}</div>
       </div>
+      <button
+        v-if="jumpToAsk"
+        class="ask-btn"
+        @click="jumpToAsk(`关于笔记「${selectedNode._detail.title}」，帮我总结要点并找出相关内容`)"
+      >
+        💬 就此笔记提问
+      </button>
     </div>
   </div>
 </template>
@@ -295,5 +305,20 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  margin-bottom: 12px;
+}
+.ask-btn {
+  width: 100%;
+  padding: 8px 14px;
+  background: var(--primary);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.ask-btn:hover {
+  opacity: 0.85;
 }
 </style>

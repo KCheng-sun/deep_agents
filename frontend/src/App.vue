@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted } from "vue";
+import { ref, computed, onMounted, provide } from "vue";
 import AddNote from "./components/AddNote.vue";
 import ImportFiles from "./components/ImportFiles.vue";
 import Search from "./components/Search.vue";
@@ -8,6 +8,7 @@ import Dashboard from "./components/Dashboard.vue";
 import Fragments from "./components/Fragments.vue";
 import RssFeeds from "./components/RssFeeds.vue";
 import GraphView from "./components/GraphView.vue";
+import Review from "./components/Review.vue";
 import { listSessions, deleteSession } from "./api/index.js";
 
 // 问答是主视图；其他功能是侧边栏工具
@@ -17,6 +18,7 @@ const tools = [
   { key: "search", label: "语义搜索", icon: "🔍", component: Search },
   { key: "fragments", label: "知识片段", icon: "💡", component: Fragments },
   { key: "graph", label: "知识图谱", icon: "🕸️", component: GraphView },
+  { key: "review", label: "间隔复习", icon: "🎴", component: Review },
   { key: "rss", label: "RSS 订阅", icon: "📡", component: RssFeeds },
   { key: "dashboard", label: "知识概览", icon: "📊", component: Dashboard },
 ];
@@ -26,11 +28,31 @@ const sessions = ref([]);
 const currentSessionId = ref(null);
 const askRefreshKey = ref(0); // 切换会话时强制 Ask 重载
 
+// 跨页跳转种子: 其他页面跳问答/搜索时携带初始内容
+const askSeed = ref(null); // { question: string, ts: number }
+const searchSeed = ref(null); // { query: string, ts: number }
+
 const currentTool = computed(() => tools.find((t) => t.key === activeView.value));
 
 function showAsk() {
   activeView.value = "ask";
 }
+
+// 跳转问答页并预填问题（图谱/片段页调用）
+function jumpToAsk(question) {
+  askSeed.value = { question, ts: Date.now() };
+  activeView.value = "ask";
+}
+
+// 跳转搜索页并预填查询（问答引用点击调用）
+function jumpToSearch(query) {
+  searchSeed.value = { query, ts: Date.now() };
+  activeView.value = "search";
+}
+
+// 供任意子组件注入使用
+provide("jumpToAsk", jumpToAsk);
+provide("jumpToSearch", jumpToSearch);
 
 async function refreshSessions() {
   try {
@@ -138,6 +160,7 @@ onMounted(refreshSessions);
           v-show="activeView === 'ask'"
           :key="askRefreshKey"
           :session-id="currentSessionId"
+          :seed="askSeed"
           @session-created="onSessionCreated"
           @session-updated="onSessionUpdated"
         />
@@ -151,7 +174,10 @@ onMounted(refreshSessions);
             <span class="tool-panel-icon">{{ currentTool?.icon }}</span>
             <h2>{{ currentTool?.label }}</h2>
           </div>
-          <component :is="currentTool?.component" />
+          <component
+            :is="currentTool?.component"
+            :seed="activeView === 'search' ? searchSeed : null"
+          />
         </div>
       </main>
     </div>

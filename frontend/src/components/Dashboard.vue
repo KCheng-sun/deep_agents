@@ -7,6 +7,7 @@ const status = ref(null);
 const digest = ref(null);
 const review = ref(null);
 const scheduler = ref([]);
+const reports = ref([]); // 定时任务生成的摘要报告
 const loading = ref(true);
 
 const RELATION_ICONS = { related: "🔗", extends: "➡️", contradicts: "⚡", references: "📖" };
@@ -14,16 +15,18 @@ const RELATION_ICONS = { related: "🔗", extends: "➡️", contradicts: "⚡",
 async function refresh() {
   loading.value = true;
   try {
-    const [s, d, r, sch] = await Promise.all([
+    const [s, d, r, sch, rp] = await Promise.all([
       getStatus(),
       getDigest(false),
       getReview(5),
       axios.get("/api/scheduler").then((res) => res.data),
+      axios.get("/api/digest/reports").then((res) => res.data),
     ]);
     status.value = s;
     digest.value = d;
     review.value = r;
     scheduler.value = sch;
+    reports.value = rp;
   } catch (e) {
     console.error(e);
   } finally {
@@ -112,9 +115,30 @@ onMounted(refresh);
     <div v-if="review?.items?.length" class="section">
       <h4>📖 需要复习 ({{ review.total }})</h4>
       <div v-for="r in review.items" :key="r.note_id" class="review-row">
-        <span :class="['dot', r.freshness < 0.2 ? 'red' : r.freshness < 0.3 ? 'yellow' : 'green']"></span>
-        [{{ r.date }}] {{ r.title }}
-        <span class="freshness">{{ (r.freshness * 100).toFixed(0) }}%</span>
+        <span :class="['dot', r.is_new ? 'blue' : r.review_count < 2 ? 'yellow' : 'green']"></span>
+        <span class="review-title">{{ r.title }}</span>
+        <span class="review-schedule">
+          {{ r.is_new ? "新卡片" : `第${r.review_count}次 · 间隔${r.interval_days}天` }}
+        </span>
+      </div>
+    </div>
+
+    <!-- 定时摘要报告（调度器生成的持久化报告） -->
+    <div v-if="reports.length" class="section">
+      <h4>🗂️ 自动摘要报告</h4>
+      <div v-for="rp in reports" :key="rp.id" class="report-card">
+        <div class="report-head">
+          <span :class="['report-badge', rp.report_type]">
+            {{ rp.report_type === "daily" ? "📅 每日" : "📊 每周" }}
+          </span>
+          <span class="report-date">{{ rp.report_date }}</span>
+        </div>
+        <div
+          class="report-content"
+          v-html="rp.content
+            .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+            .replace(/\n/g, '<br>')"
+        ></div>
       </div>
     </div>
 
@@ -248,10 +272,60 @@ onMounted(refresh);
 .dot.red { background: var(--danger); }
 .dot.yellow { background: #f39c12; }
 .dot.green { background: var(--success); }
+.dot.blue { background: var(--primary); }
+.review-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.review-schedule {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+}
 .freshness {
   margin-left: auto;
   font-size: 12px;
   color: var(--text-dim);
+}
+.report-card {
+  padding: 14px 16px;
+  margin-bottom: 10px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.report-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.report-badge {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 12px;
+}
+.report-badge.daily {
+  background: rgba(0, 132, 255, 0.1);
+  color: var(--primary);
+}
+.report-badge.weekly {
+  background: rgba(0, 184, 212, 0.1);
+  color: var(--accent);
+}
+.report-date {
+  font-size: 12px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+}
+.report-content {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.7;
 }
 .task-row {
   display: flex;

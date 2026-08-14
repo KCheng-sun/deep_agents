@@ -1,9 +1,14 @@
 <script setup>
-import { ref, reactive, nextTick, watch, onMounted } from "vue";
+import { ref, reactive, nextTick, watch, onMounted, inject } from "vue";
 import { getSessionMessages } from "../api/index.js";
+
+// 跨页跳转：点击答案中的 [笔记引用] 跳搜索页
+const jumpToSearch = inject("jumpToSearch", null);
 
 const props = defineProps({
   sessionId: { type: String, default: null },
+  // 跨页跳转种子: { question, ts } —— 其他页面跳来时预填问题
+  seed: { type: Object, default: null },
 });
 
 const emit = defineEmits(["session-created", "session-updated"]);
@@ -15,9 +20,21 @@ const chatEl = ref(null);
 const statusMsg = ref(""); // 当前状态提示
 let currentSessionId = props.sessionId; // 本地追踪（后端创建新会话时更新）
 
+// 图谱/片段页跳转过来时预填问题（不自动发送，让用户确认）
+watch(
+  () => props.seed,
+  (newSeed) => {
+    if (newSeed && newSeed.question) {
+      question.value = newSeed.question;
+      scrollToBottom();
+    }
+  },
+  { immediate: true }
+);
+
 function renderMarkdown(text) {
   if (!text) return "";
-  return text
+  let html = text
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
@@ -25,6 +42,24 @@ function renderMarkdown(text) {
     .replace(/\n/g, "<br>")
     .replace(/^/, "<p>")
     .replace(/$/, "</p>");
+
+  // [笔记标题] 引用转可点击标签（跳搜索页查原文）
+  if (jumpToSearch) {
+    html = html.replace(
+      /\[([^\]]{2,60})\]/g,
+      '<span class="ref-link" data-title="$1">「$1」</span>'
+    );
+  }
+  return html;
+}
+
+// 点击引用标签 → 跳转搜索页（事件委托，避免流式渲染时重复绑事件）
+function onRefClick(e) {
+  if (!jumpToSearch) return;
+  const el = e.target.closest(".ref-link");
+  if (el && el.dataset.title) {
+    jumpToSearch(el.dataset.title);
+  }
 }
 
 function scrollToBottom() {
@@ -279,7 +314,7 @@ function formatArgs(args) {
 
 <template>
   <div class="ask-page">
-    <div ref="chatEl" class="chat-box">
+    <div ref="chatEl" class="chat-box" @click="onRefClick">
       <!-- 空状态欢迎页 -->
       <div v-if="messages.length === 0" class="welcome">
         <div class="welcome-logo">🧠</div>
@@ -693,6 +728,21 @@ function formatArgs(args) {
 
 .answer-text :deep(strong) {
   color: var(--primary);
+}
+
+/* 可点击的笔记引用标签 */
+.answer-text :deep(.ref-link),
+.thought-text :deep(.ref-link) {
+  color: var(--primary);
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  transition: all 0.12s;
+}
+.answer-text :deep(.ref-link:hover),
+.thought-text :deep(.ref-link:hover) {
+  background: rgba(0, 132, 255, 0.1);
+  border-radius: 3px;
 }
 
 /* 思考中 */
