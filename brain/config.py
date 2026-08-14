@@ -129,6 +129,7 @@ def get_config() -> AppConfig:
         load_dotenv(dotenv_path=env_path, override=True)
         _config = AppConfig()
         _ensure_directories(_config)
+        _setup_file_logging(_config)
     return _config
 
 
@@ -138,3 +139,23 @@ def _ensure_directories(cfg: AppConfig) -> None:
     cfg.storage.notes_dir.mkdir(parents=True, exist_ok=True)
     cfg.storage.chroma_dir.mkdir(parents=True, exist_ok=True)
     cfg.storage.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _setup_file_logging(cfg: AppConfig) -> None:
+    """配置 loguru 滚动文件日志（终端之外持久化，重启不丢）。"""
+    from loguru import logger
+
+    log_dir = cfg.storage.data_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # 每个文件最多 5MB，保留 3 个滚动文件
+    logger.add(
+        log_dir / "brain.log",
+        rotation="5 MB",
+        retention=3,
+        level=cfg.log_level,
+        encoding="utf-8",
+        enqueue=True,  # 多线程安全
+        backtrace=False,
+        diagnose=False,
+    )

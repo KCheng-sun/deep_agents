@@ -1,0 +1,113 @@
+"""性能回归测试 — 成功指标 NFR2/成功指标4：500+ 笔记保持响应。
+
+在临时库批量摄入 500 条笔记后，验证核心读接口响应时间。
+摄入不依赖 LLM（classify/connect 被 mock），500 条应秒级完成。
+"""
+
+import hashlib
+import time
+
+import pytest
+from fastapi.testclient import TestClient
+
+
+def _mock_embedding(texts: list[str]) -> list[list[float]]:
+    result = []
+    for text in texts:
+        h = hashlib.sha256(text.encode()).digest()
+        vec = [(h[i % len(h)] / 255.0) * 2 - 1 for i in range(384)]
+        norm = sum(v * v for v in vec) ** 0.5
+        result.append([v / norm for v in vec])
+    return result
+
+
+@pytest.fixture
+def bulk_client(tmp_path, monkeypatch):
+    """500 条笔记的测试客户端。"""
+    import brain.config as config_module
+    import brain.api.server as server_module
+
+    from brain.config import AppConfig, StorageSettings
+
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    cfg = AppConfig()
+    cfg.storage = StorageSettings(
+        data_dir=tmp_path / "data",
+        notes_dir=tmp_path / "notes",
+        chroma_dir=tmp_path / "chroma",
+        db_path=tmp_path / "metadata.db",
+    )
+    monkeypatch.setattr(config_module, "_config", cfg)
+    monkeypatch.setattr(server_module, "get_embedding_fn", lambda: _mock_embedding)
+
+    # mock AI 节点
+    from brain.agents.classifier import ClassificationOutput, ClassifierAgent, TypeItem
+    from brain.agents.connector import ConnectionOutput, ConnectorAgent
+
+    monkeypatch.setattr(
+        ClassifierAgent, "run",
+        lambda self, **kwargs: ClassificationOutput(
+            topics=[], content_type=TypeItem(name="总结/笔记", confidence=0.9)
+        ),
+    )
+    monkeypatch.setattr(
+        ConnectorAgent, "run",
+        lambda self, **kwargs: ConnectionOutput(connections=[]),
+    )
+
+    server_module._pipeline = None
+    server_module._vector_store = None
+    server_module._metadata_store = None
+    server_module._checkpointer = None
+    server_module._watcher = None
+
+    with TestClient(server_module.app) as c:
+        # 批量摄入 500 条
+        for i in range(500):
+            c.post("/api/notes", json={
+                "text": f"性能测试笔记 {i}: 关于知识管理的自动化处理流程",
+                "title": f"笔记 {i}",
+            })
+        yield c
+
+
+class TestPerformance:
+    """响应时间上限（宽松阈值，CI 机器性能差异大）"""
+
+    def test_status_under_2s(self, bulk_client):
+        t0 = time.perf_counter()
+        resp = bulk_client.get("/api/status")
+        elapsed = time.perf_counter() - t0
+        assert resp.status_code == 200
+        assert resp.json()["note_count"] == 500
+        assert elapsed < 2.0, f"status 响应 {elapsed:.2f}s 超过 2s"
+
+    def test_search_under_2s(self, bulk_client):
+        t0 = time.perf_counter()
+        resp = bulk_client.get("/api/search", params={"query": "知识管理", "top_k": 5})
+        elapsed = time.perf_counter() - t0
+        assert resp.status_code == 200
+        assert resp.json()["total"] >= 1
+        assert elapsed < 2.0, f"search 响应 {elapsed:.2f}s 超过 2s"
+
+    def test_graph_under_2s(self, bulk_client):
+        t0 = time.perf_counter()
+        resp = bulk_client.get("/api/graph")
+        elapsed = time.perf_counter() - t0
+        assert resp.status_code == 200
+        assert len(resp.json()["nodes"]) == 500
+        assert elapsed < 2.0, f"graph 响应 {elapsed:.2f}s 超过 2s"
+
+    def test_connections_under_2s(self, bulk_client):
+        t0 = time.perf_counter()
+        resp = bulk_client.get("/api/connections")
+        elapsed = time.perf_counter() - t0
+        assert resp.status_code == 200
+        assert elapsed < 2.0, f"connections 响应 {elapsed:.2f}s 超过 2s"
+
+    def test_review_under_2s(self, bulk_client):
+        t0 = time.perf_counter()
+        resp = bulk_client.get("/api/review", params={"limit": 20})
+        elapsed = time.perf_counter() - t0
+        assert resp.status_code == 200
+        assert elapsed < 2.0, f"review 响应 {elapsed:.2f}s 超过 2s"

@@ -104,6 +104,10 @@
 | FR23 | 测试补齐 | 存储/API/HIL 链路测试，防回归 |
 | FR24 | 定时任务调度 | RSS 自动拉取（每60分钟）、每日摘要（08:00）、每周趋势（周一）自动生成并持久化 |
 | FR25 | 知识图谱可视化 | 笔记-关联交互式图谱：节点大小=关联数，点击高亮邻居，边色=关联类型 |
+| FR26 | 知识片段向量化 | 片段写入 ChromaDB 独立 collection，search_fragments 改语义检索 |
+| FR27 | 同会话记忆加权 | 检索记忆时同会话旧消息权重提升，保住超窗口对话连续性 |
+| FR28 | SM-2 间隔重复 | 复习卡片 + 四档评分（忘记/困难/良好/简单）+ SM-2 算法调度 |
+| FR29 | 工程化 | GitHub Actions CI、loguru 日志文件持久化、性能回归测试、README 重写 |
 
 **Phase 3 技术要点：**
 - 新增 `brain/services/` 层：DigestService + ReviewService
