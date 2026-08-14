@@ -1,0 +1,61 @@
+# ============================================================
+# Phase 1 核心依赖
+# ============================================================
+
+# LangChain 生态
+langchain>=0.3.0
+langchain-community>=0.3.0
+langgraph>=0.2.0
+
+# DeepAgents (Phase 2 正式使用，Phase 1 先装上)
+deepagents>=0.1.0
+
+# LLM — DeepSeek (OpenAI 兼容协议)
+langchain-openai>=0.3.0
+
+# LLM — Anthropic (备选)
+# langchain-anthropic>=0.3.0
+
+# 向量存储
+chromadb>=0.5.0
+
+# 本地 Embedding
+sentence-transformers>=3.0.0
+
+# CLI
+click>=8.1.0
+
+# 配置管理
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# 异步 SQLite
+aiosqlite>=0.20.0
+
+# 文件监听
+watchdog>=4.0.0
+
+# RSS 订阅
+feedparser>=6.0.0
+
+# Markdown 解析
+markdown>=3.5.0
+
+# 日志
+loguru>=0.7.0
+
+# Token 计数
+tiktoken>=0.7.0
+
+# Web API + UI
+fastapi>=0.115.0
+uvicorn>=0.32.0
+python-multipart>=0.0.12
+
+# ============================================================
+# 开发依赖
+# ============================================================
+# pytest / pytest-asyncio / ruff
+# 通过 pip install -r requirements-dev.txt 安装
