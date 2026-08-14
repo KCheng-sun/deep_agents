@@ -7,6 +7,7 @@ import Ask from "./components/Ask.vue";
 import Dashboard from "./components/Dashboard.vue";
 import Fragments from "./components/Fragments.vue";
 import RssFeeds from "./components/RssFeeds.vue";
+import GraphView from "./components/GraphView.vue";
 import { listSessions, deleteSession } from "./api/index.js";
 
 // 问答是主视图；其他功能是侧边栏工具
@@ -15,6 +16,7 @@ const tools = [
   { key: "import", label: "导入文件", icon: "📥", component: ImportFiles },
   { key: "search", label: "语义搜索", icon: "🔍", component: Search },
   { key: "fragments", label: "知识片段", icon: "💡", component: Fragments },
+  { key: "graph", label: "知识图谱", icon: "🕸️", component: GraphView },
   { key: "rss", label: "RSS 订阅", icon: "📡", component: RssFeeds },
   { key: "dashboard", label: "知识概览", icon: "📊", component: Dashboard },
 ];
@@ -140,8 +142,11 @@ onMounted(refreshSessions);
           @session-updated="onSessionUpdated"
         />
 
-        <!-- 工具页 -->
-        <div v-if="activeView !== 'ask'" class="tool-panel">
+        <!-- 工具页（图谱页用宽面板） -->
+        <div
+          v-if="activeView !== 'ask'"
+          :class="['tool-panel', { 'tool-panel-wide': activeView === 'graph' }]"
+        >
           <div class="tool-panel-header">
             <span class="tool-panel-icon">{{ currentTool?.icon }}</span>
             <h2>{{ currentTool?.label }}</h2>
@@ -408,6 +413,12 @@ body {
   max-width: 820px;
   margin: 0 auto;
   padding: 28px 24px 60px;
+}
+
+/* 知识图谱等宽幅工具页占满内容区 */
+.tool-panel-wide {
+  max-width: none;
+  padding: 20px 24px 40px;
 }
 
 .tool-panel-header {

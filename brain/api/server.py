@@ -54,10 +54,11 @@ _vector_store: VectorStore | None = None
 _metadata_store: MetadataStore | None = None
 _checkpointer = None  # LangGraph SqliteSaver——HIL 中断恢复用
 _watcher = None  # FileWatcher——文件监听（可经 API 启停）
+_scheduler = None  # TaskScheduler——定时任务调度
 
 
 def _init():
-    global _pipeline, _vector_store, _metadata_store, _checkpointer
+    global _pipeline, _vector_store, _metadata_store, _checkpointer, _scheduler
     if _metadata_store is not None:
         return
     cfg = get_config()
@@ -80,6 +81,12 @@ def _init():
     checkpoint_path = cfg.storage.data_dir / "checkpoints.db"
     conn = sqlite3.connect(str(checkpoint_path), check_same_thread=False)
     _checkpointer = SqliteSaver(conn)
+
+    # 定时任务调度器
+    from brain.services.scheduler import build_default_scheduler
+
+    _scheduler = build_default_scheduler(_pipeline, _metadata_store, _vector_store)
+    _scheduler.start()
 
 
 # 启动时预初始化
@@ -686,6 +693,91 @@ def rss_delete(feed_id: int):
 
         raise HTTPException(status_code=404, detail="订阅源不存在")
     return {"ok": True}
+
+
+# ============================================================
+# 定时任务调度 API
+# ============================================================
+
+
+@app.get("/api/scheduler")
+def scheduler_status():
+    """查询定时任务状态。"""
+    _init()
+    if _scheduler is None:
+        return []
+    return _scheduler.get_status()
+
+
+@app.post("/api/scheduler/run/{task_name}")
+def scheduler_run_now(task_name: str):
+    """手动立即执行某定时任务。
+
+    task_name: rss_sync | daily_digest | weekly_digest
+    """
+    _init()
+    if _scheduler is None:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=503, detail="调度器未初始化")
+
+    result = _scheduler.run_now(task_name)
+    if result is None:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=404, detail=f"任务不存在: {task_name}")
+    return {"task": task_name, "result": result}
+
+
+@app.get("/api/digest/reports")
+def digest_reports(limit: int = Query(10, ge=1, le=50)):
+    """列出最近生成的摘要报告（定时任务产物）。"""
+    _init()
+    return _metadata_store.list_digest_reports(limit=limit)
+
+
+@app.get("/api/graph")
+def knowledge_graph():
+    """知识图谱数据——笔记节点 + 关联边。"""
+    _init()
+
+    all_notes = _metadata_store.list_notes(limit=10000)
+    all_conns: list[dict] = []
+    seen_pairs = set()
+
+    for note in all_notes:
+        conns = _metadata_store.get_connections(note.id)
+        for c in conns:
+            pair = tuple(sorted([c.source_note_id, c.target_note_id]))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            all_conns.append({
+                "source": c.source_note_id,
+                "target": c.target_note_id,
+                "relation_type": c.relation_type.value,
+                "strength": c.strength,
+                "description": c.description or "",
+            })
+
+    # 节点信息（含标签和关联数）
+    nodes = []
+    degree = {}
+    for conn in all_conns:
+        degree[conn["source"]] = degree.get(conn["source"], 0) + 1
+        degree[conn["target"]] = degree.get(conn["target"], 0) + 1
+
+    for note in all_notes:
+        tags = _metadata_store.get_note_tags(note.id)
+        nodes.append({
+            "id": note.id,
+            "title": note.title[:30],
+            "tags": [t.name for t in tags][:3],
+            "degree": degree.get(note.id, 0),
+            "date": note.ingested_at[:10] if note.ingested_at else "",
+        })
+
+    return {"nodes": nodes, "edges": all_conns}
 
 
 @app.get("/api/status", response_model=StatusResponse)

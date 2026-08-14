@@ -149,6 +149,15 @@ class MetadataStore:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS digest_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_type TEXT NOT NULL,       -- 'daily' | 'weekly'
+                report_date TEXT NOT NULL,       -- 报告日期（daily: 昨日日期; weekly: 周一日期）
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(report_type, report_date)
+            );
+
             CREATE TABLE IF NOT EXISTS rss_feeds (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 url TEXT NOT NULL UNIQUE,
@@ -569,6 +578,43 @@ class MetadataStore:
             }
             for r in rows
         ]
+
+    # ---- Digest Reports（定时任务生成的摘要报告） ----
+
+    @_synchronized
+    def save_digest_report(self, report_type: str, report_date: str, content: str) -> int:
+        """保存摘要报告（同类型同日期覆盖）。"""
+        assert self._conn is not None
+        cur = self._conn.execute(
+            """INSERT INTO digest_reports (report_type, report_date, content, created_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(report_type, report_date) DO UPDATE SET
+                 content = excluded.content,
+                 created_at = excluded.created_at""",
+            (report_type, report_date, content, datetime.now().isoformat()),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    @_synchronized
+    def get_digest_report(self, report_type: str, report_date: str) -> dict | None:
+        """按类型和日期获取摘要报告。"""
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT id, report_type, report_date, content, created_at FROM digest_reports WHERE report_type = ? AND report_date = ?",
+            (report_type, report_date),
+        ).fetchone()
+        return dict(row) if row else None
+
+    @_synchronized
+    def list_digest_reports(self, limit: int = 10) -> list[dict]:
+        """列出最近摘要报告。"""
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT id, report_type, report_date, content, created_at FROM digest_reports ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ---- RSS Feeds ----
 

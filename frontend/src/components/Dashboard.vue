@@ -1,10 +1,12 @@
 <script setup>
 import { ref, onMounted } from "vue";
 import { getStatus, getDigest, getReview } from "../api/index.js";
+import axios from "axios";
 
 const status = ref(null);
 const digest = ref(null);
 const review = ref(null);
+const scheduler = ref([]);
 const loading = ref(true);
 
 const RELATION_ICONS = { related: "🔗", extends: "➡️", contradicts: "⚡", references: "📖" };
@@ -12,19 +14,26 @@ const RELATION_ICONS = { related: "🔗", extends: "➡️", contradicts: "⚡",
 async function refresh() {
   loading.value = true;
   try {
-    const [s, d, r] = await Promise.all([
+    const [s, d, r, sch] = await Promise.all([
       getStatus(),
       getDigest(false),
       getReview(5),
+      axios.get("/api/scheduler").then((res) => res.data),
     ]);
     status.value = s;
     digest.value = d;
     review.value = r;
+    scheduler.value = sch;
   } catch (e) {
     console.error(e);
   } finally {
     loading.value = false;
   }
+}
+
+function formatTime(iso) {
+  const d = new Date(iso);
+  return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
 onMounted(refresh);
@@ -106,6 +115,21 @@ onMounted(refresh);
         <span :class="['dot', r.freshness < 0.2 ? 'red' : r.freshness < 0.3 ? 'yellow' : 'green']"></span>
         [{{ r.date }}] {{ r.title }}
         <span class="freshness">{{ (r.freshness * 100).toFixed(0) }}%</span>
+      </div>
+    </div>
+
+    <!-- 定时任务状态 -->
+    <div v-if="scheduler.length" class="section">
+      <h4>⏰ 定时任务</h4>
+      <div v-for="t in scheduler" :key="t.name" class="task-row">
+        <div class="task-info">
+          <span class="task-name">{{ t.description }}</span>
+          <span class="task-result">{{ t.last_result || "尚未运行" }}</span>
+        </div>
+        <div class="task-meta">
+          <span>上次: {{ t.last_run_at ? formatTime(t.last_run_at) : "—" }}</span>
+          <span>下次: {{ t.next_run_at ? formatTime(t.next_run_at) : "—" }}</span>
+        </div>
       </div>
     </div>
   </div>
@@ -228,5 +252,36 @@ onMounted(refresh);
   margin-left: auto;
   font-size: 12px;
   color: var(--text-dim);
+}
+.task-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.task-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1;
+}
+.task-name {
+  font-size: 14px;
+  font-weight: 500;
+}
+.task-result {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.task-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  text-align: right;
+  flex-shrink: 0;
 }
 </style>
